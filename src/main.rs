@@ -17,7 +17,7 @@ fn main() {
 
     println!("🔁 Libération d'une IP et réattribution :");
     let ip_to_release = "192.168.1.101".parse().unwrap();
-    pool.release_ip(&ip_to_release);
+    pool.release_ip(ip_to_release);
 
     match pool.lease_ip() {
         Some(ip) => println!("🔁 IP réattribuée : {}", ip),

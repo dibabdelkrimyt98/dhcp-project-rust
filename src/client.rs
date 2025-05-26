@@ -1,49 +1,50 @@
 use std::net::UdpSocket;
 use std::str;
+use std::time::Duration;
+use std::thread;
+use std::io;
 
 fn main() -> std::io::Result<()> {
-    let server_addr = "127.0.0.1:6767";
     let socket = UdpSocket::bind("127.0.0.1:0")?;
-    socket.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+    socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let server_addr = "127.0.0.1:6767";
 
-    println!("🔵 [DHCP Client] Démarré");
-
-    // Étape 1: Envoi DISCOVER
-    println!("\n➡️  Étape 1: Envoi de DISCOVER au serveur {}", server_addr);
+    println!("🔎 Envoi DISCOVER...");
     socket.send_to(b"DISCOVER", server_addr)?;
 
     let mut buf = [0u8; 1024];
+    match socket.recv_from(&mut buf) {
+        Ok((len, _)) => {
+            let msg = String::from_utf8_lossy(&buf[..len]).to_string(); // éviter l'emprunt prolongé
+            println!("📨 Réponse serveur : {}", msg);
 
-    // Étape 2: Attente de l'OFFER
-    let (len, _) = socket.recv_from(&mut buf)?;
-    let offer_msg = String::from_utf8_lossy(&buf[..len]);
-    println!("⬅️  Étape 2: Réception de l’offre du serveur : {}", offer_msg);
+            if msg.starts_with("OFFER:") {
+                let ip = msg.trim_start_matches("OFFER:");
+                let request = format!("REQUEST:{}", ip);
+                println!("📥 Envoi de la requête de demande IP {}...", ip); // Pas d'échappement inutile
+                socket.send_to(request.as_bytes(), server_addr)?;
 
-    if !offer_msg.starts_with("OFFER:") {
-        eprintln!("Erreur : Offre attendue, reçu autre chose : {}", offer_msg);
-        return Ok(());
-    }
+                let mut ack_buf = [0u8; 1024]; // buffer séparé si tu veux éviter tout conflit
+                match socket.recv_from(&mut ack_buf) {
+                    Ok((ack_len, _)) => {
+                        let ack_msg = String::from_utf8_lossy(&ack_buf[..ack_len]).to_string();
+                        println!("✅ Réponse finale : {}", ack_msg);
 
-    let ip = offer_msg.trim_start_matches("OFFER:").trim();
+                        if ack_msg.starts_with("ACK:") {
+                            println!("🎉 IP {} assignée avec succès!", ip);
 
-    // Étape 3: Envoi REQUEST
-    println!("\n➡️  Étape 3: Envoi de REQUEST:{} au serveur", ip);
-    let request_msg = format!("REQUEST:{}", ip);
-    socket.send_to(request_msg.as_bytes(), server_addr)?;
-
-    // Étape 4: Attente ACK ou NACK
-    let (len, _) = socket.recv_from(&mut buf)?;
-    let resp = String::from_utf8_lossy(&buf[..len]);
-
-    if resp.starts_with("ACK:") {
-        let assigned_ip = resp.trim_start_matches("ACK:").trim();
-        println!("✅ Adresse IP attribuée : {}\n", assigned_ip);
-    } else if resp.starts_with("NACK:") {
-        eprintln!("❌ Le serveur a refusé la demande : {}", resp);
-    } else if resp.starts_with("ERROR:") {
-        eprintln!("❌ Erreur reçue du serveur : {}", resp);
-    } else {
-        eprintln!("❌ Réponse inattendue du serveur : {}", resp);
+                            // Simuler une utilisation puis RELEASE
+                            thread::sleep(Duration::from_secs(5));
+                            let release = format!("RELEASE:{}", ip);
+                            socket.send_to(release.as_bytes(), server_addr)?;
+                            println!("🔓 IP {} relâchée.", ip);
+                        }
+                    }
+                    Err(e) => println!("❌ Timeout ou erreur lors du ACK: {}", e),
+                }
+            }
+        }
+        Err(e) => println!("❌ Timeout ou erreur lors du OFFER: {}", e),
     }
 
     Ok(())
