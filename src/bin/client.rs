@@ -45,7 +45,16 @@ fn main() -> std::io::Result<()> {
                         
                             let release = format!("RELEASE:{}", ip);
                             socket.send_to(release.as_bytes(), server_addr)?;
-                            println!("🔓 IP {} relâchée.", ip);
+                            println!("🔓 Demande de libération de l'IP envoyée...");
+                            
+                            // 🔁 Attente de la confirmation du serveur
+                            match socket.recv_from(&mut buf) {
+                                Ok((len, _)) => {
+                                    let confirmation = str::from_utf8(&buf[..len]).unwrap_or("");
+                                    println!("📩 Confirmation serveur : {}", confirmation);
+                                }
+                                Err(e) => println!("⚠️  Aucune confirmation reçue du serveur : {}", e),
+                            }
                         }
                     }
                     Err(e) => println!("❌ Timeout ou erreur lors du ACK: {}", e),
