@@ -1,186 +1,159 @@
 use std::collections::HashMap;
 use std::io::{self, Write};
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
-use std::str;
-use std::time::Duration;
+use std::net::UdpSocket;
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+use chrono::Local;
+use colored::*;
 use dhcp_demo::ip_pool::IpPool;
 
 #[derive(Debug, Clone)]
 struct ClientInfo {
-    ip: Ipv4Addr,
-    active: bool,
-    events: Vec<String>,
+    ip: String,
+    historique: Vec<String>,
+    actif: bool,
 }
 
-fn main() -> std::io::Result<()> {
-    let socket = UdpSocket::bind("127.0.0.1:6767")?;
-    socket.set_nonblocking(true)?;
-    println!("🟢 [DHCP Server] En écoute sur 127.0.0.1:6767");
+fn afficher_clients(clients: &HashMap<String, ClientInfo>) {
+    println!("\n📋 Clients connectés :");
+    for (addr, client) in clients {
+        let status = if client.actif { "connecté".green() } else { "déconnecté".red() };
+        println!("🔹 {} => {} [{}]", addr, client.ip, status);
+    }
+}
 
-    let mut pool = IpPool::new(100, 110);
-    let mut buf = [0u8; 1024];
-    let mut clients: HashMap<SocketAddr, ClientInfo> = HashMap::new();
-    let mut history: HashMap<SocketAddr, ClientInfo> = HashMap::new();
-    let mut running = true;
-
-    while running {
-        match socket.recv_from(&mut buf) {
-            Ok((len, src)) => {
-                let msg = str::from_utf8(&buf[..len]).unwrap_or("");
-                println!("📩 Reçu de {} : {}", src, msg);
-
-                if msg == "DISCOVER" {
-                    if let Some(ip) = pool.lease_ip() {
-                        let offer = format!("OFFER:{}", ip);
-                        socket.send_to(offer.as_bytes(), src)?;
-                        let info = ClientInfo {
-                            ip,
-                            active: true,
-                            events: vec!["DISCOVER → OFFER".to_string()],
-                        };
-                        clients.insert(src, info.clone());
-                        history.insert(src, info);
-                        println!("📤 OFFER envoyé à {} : {}\n", src, ip);
-                    } else {
-                        println!("❌ Plus d'IP disponibles à offrir !");
-                    }
-                } else if msg.starts_with("REQUEST:") {
-                    let ip_str = msg.trim_start_matches("REQUEST:");
-                    if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
-                        if pool.confirm_lease(ip) {
-                            let ack = format!("ACK:{}", ip);
-                            socket.send_to(ack.as_bytes(), src)?;
-                            clients.entry(src).and_modify(|c| {
-                                c.active = true;
-                                c.ip = ip;
-                                c.events.push("REQUEST → ACK".to_string());
-                            }).or_insert(ClientInfo {
-                                ip,
-                                active: true,
-                                events: vec!["REQUEST → ACK".to_string()],
-                            });
-                            history.entry(src).or_insert_with(|| clients[&src].clone());
-                            println!("✅ IP {} attribuée à {}\n", ip, src);
-                        } else {
-                            println!("⚠️ IP {} déjà louée ou invalide !", ip);
-                        }
-                    } else {
-                        println!("❌ Format d’IP invalide reçu : {}", ip_str);
-                    }
-                } else {
-                    println!("⚠️ Message inconnu reçu : {}", msg);
-                }
-            }
-
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(200));
-                show_menu(&mut clients, &mut history, &mut pool, &mut running);
-            }
-
-            Err(e) => {
-                eprintln!("❌ Erreur de socket : {}", e);
-            }
+fn afficher_historique(clients: &HashMap<String, ClientInfo>) {
+    println!("\n📜 Historique des clients :");
+    for (addr, client) in clients {
+        println!(
+            "🧾 {} → {} [{}]",
+            addr,
+            client.ip,
+            if client.actif { "connecté".green() } else { "déconnecté".red() }
+        );
+        for event in &client.historique {
+            println!("   ➜ {}", event);
         }
     }
-
-    println!("⛔ Serveur arrêté.");
-    Ok(())
 }
 
-fn show_menu(
-    clients: &mut HashMap<SocketAddr, ClientInfo>,
-    history: &mut HashMap<SocketAddr, ClientInfo>,
-    pool: &mut IpPool,
-    running: &mut bool,
-) {
-    println!("\n===== MENU DHCP =====");
-    println!("1️⃣  Afficher les clients connectés");
-    println!("2️⃣  Supprimer un client (libérer une IP)");
-    println!("3️⃣  Historique des clients");
-    println!("4️⃣  Éteindre le serveur");
-    print!("👉 Choix : ");
-    io::stdout().flush().unwrap();
+fn main() -> io::Result<()> {
+    let socket = UdpSocket::bind("127.0.0.1:6767")?;
+    println!("🚀 Serveur DHCP démarré sur {}", socket.local_addr()?);
 
-    let mut choice = String::new();
-    if let Ok(_) = io::stdin().read_line(&mut choice) {
-        match choice.trim() {
-            "1" => {
-                if clients.is_empty() {
-                    println!("📭 Aucun client actif.");
+    let clients: Arc<Mutex<HashMap<String, ClientInfo>>> = Arc::new(Mutex::new(HashMap::new()));
+    let clients_clone = Arc::clone(&clients);
+    let pool = Arc::new(Mutex::new(IpPool::new(100, 200))); // 192.168.1.100 à 192.168.1.200
+    let pool_clone = Arc::clone(&pool);
+
+    thread::spawn(move || loop {
+        let mut buf = [0; 512];
+        if let Ok((amt, src)) = socket.recv_from(&mut buf) {
+            let msg = String::from_utf8_lossy(&buf[..amt]);
+            let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+            println!("📩 [{}] Reçu de {} : {}", now, src, msg);
+
+            let mut clients = clients_clone.lock().unwrap();
+            let mut pool = pool_clone.lock().unwrap();
+
+            let entry = clients.entry(src.to_string()).or_insert(ClientInfo {
+                ip: "0.0.0.0".into(),
+                historique: Vec::new(),
+                actif: false,
+            });
+
+            let event = format!("{} ➜ {}", msg, now);
+            entry.historique.push(event.clone());
+
+            if msg.starts_with("DISCOVER") {
+                if let Some(ip) = pool.lease_ip() {
+                    entry.ip = ip.to_string();
+                    entry.actif = true;
+                    let offer = format!("OFFER:{}", ip);
+                    let _ = socket.send_to(offer.as_bytes(), src);
                 } else {
-                    println!("📋 Clients connectés :");
-                    for (addr, info) in clients.iter() {
-                        println!("🔹 {} => {} [{}]", addr, info.ip, "actif");
-                    }
+                    let _ = socket.send_to(b"OFFER:0.0.0.0", src);
                 }
+            } else if msg.starts_with("REQUEST:") {
+                let ip_requested = msg.trim_start_matches("REQUEST:").trim();
+                if ip_requested == entry.ip {
+                    entry.actif = true;
+                    let ack = format!("ACK:{}", ip_requested);
+                    let _ = socket.send_to(ack.as_bytes(), src);
+                } else {
+                    let _ = socket.send_to(b"NAK", src);
+                }
+            } else if msg.starts_with("RELEASE:") {
+                let ip_to_release = msg.trim_start_matches("RELEASE:").trim();
+                if ip_to_release == entry.ip {
+                    pool.release_ip(&entry.ip.parse().unwrap());
+                    entry.actif = false;
+                    let _ = socket.send_to(b"RELEASED", src);
+                }
+            } else {
+                println!("⚠️ Message inconnu reçu : {}", msg);
+            }
+        }
+    });
+
+    // Interface Console
+    loop {
+        println!(
+            "\n===== MENU DHCP =====\n\
+            1️⃣  Afficher les clients connectés\n\
+            2️⃣  Supprimer un client (libérer une IP)\n\
+            3️⃣  Historique des clients\n\
+            4️⃣  Éteindre le serveur\n\
+            👉 Choix : "
+        );
+        io::stdout().flush()?;
+        let mut choix = String::new();
+        io::stdin().read_line(&mut choix)?;
+
+        match choix.trim() {
+            "1" => {
+                let clients = clients.lock().unwrap();
+                afficher_clients(&clients);
             }
             "2" => {
-                if clients.is_empty() {
-                    println!("📭 Aucun client actif.");
-                    return;
-                }
-
-                println!("📋 Liste des clients :");
-                for (addr, info) in clients.iter() {
-                    println!("🔸 {} => {}", addr, info.ip);
-                }
-
-                println!("✏️ Entrez l'IP à supprimer (ex: 192.168.1.105) :");
-                let mut ip_input = String::new();
-                if io::stdin().read_line(&mut ip_input).is_ok() {
-                    let ip_str = ip_input.trim();
-                    if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
-                        let maybe_addr = clients.iter()
-                            .find(|(_, c)| c.ip == ip)
-                            .map(|(addr, _)| *addr);
-
-                        if let Some(addr) = maybe_addr {
-                            print!("❓ Voulez-vous vraiment supprimer ce client ? (O/N): ");
-                            io::stdout().flush().unwrap();
-                            let mut confirm = String::new();
-                            if io::stdin().read_line(&mut confirm).is_ok() {
-                                if confirm.trim().eq_ignore_ascii_case("O") {
-                                    if let Some(mut client) = clients.remove(&addr) {
-                                        client.active = false;
-                                        client.events.push("🔴 IP libérée manuellement".to_string());
-                                        pool.release_ip(&client.ip);
-                                        history.insert(addr, client);
-                                        println!("✅ Client supprimé et IP {} libérée.", ip);
-                                    }
-                                } else {
-                                    println!("❌ Suppression annulée.");
-                                }
-                            }
-                        } else {
-                            println!("❌ Aucun client actif avec cette IP.");
-                        }
-                    } else {
-                        println!("❌ IP invalide !");
+                print!("🔧 Entrez l'adresse du client à supprimer : ");
+                io::stdout().flush()?;
+                let mut addr = String::new();
+                io::stdin().read_line(&mut addr)?;
+                let addr = addr.trim();
+                
+                let mut clients = clients.lock().unwrap();
+                let mut pool = pool.lock().unwrap();
+                
+                if let Some((key, client)) = clients.iter_mut().find(|(_, c)| c.ip == addr) {
+                    if client.actif {
+                        pool.release_ip(&client.ip.parse().unwrap());
                     }
+                    client.actif = false;
+                    println!("✅ Client avec l'IP {} libéré.", addr);
+                } else if let Some(client) = clients.get_mut(addr) {
+                    // Ancienne logique si c’est une IP:PORT
+                    if client.actif {
+                        pool.release_ip(&client.ip.parse().unwrap());
+                    }
+                    client.actif = false;
+                    println!("✅ Client {} libéré.", addr);
+                } else {
+                    println!("❌ Client introuvable.");
                 }
             }
             "3" => {
-                if history.is_empty() {
-                    println!("📭 Aucun historique enregistré.");
-                } else {
-                    println!("📜 Historique des clients :");
-                    for (addr, info) in history.iter() {
-                        println!(
-                            "🧾 {} → {} [{}]",
-                            addr,
-                            info.ip,
-                            if info.active { "actif" } else { "supprimé" }
-                        );
-                        for ev in &info.events {
-                            println!("   ➜ {}", ev);
-                        }
-                    }
-                }
+                let clients = clients.lock().unwrap();
+                afficher_historique(&clients);
             }
             "4" => {
-                *running = false;
+                println!("🛑 Arrêt du serveur...");
+                break;
             }
-            _ => println!("❌ Choix invalide."),
+            _ => println!("❌ Choix invalide"),
         }
     }
+
+    Ok(())
 }

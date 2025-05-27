@@ -10,3 +10,9 @@ path = "src/bin/client.rs"
 [[bin]]
 name = "server"
 path = "src/bin/server.rs"
+
+
+
+[dependencies]
+chrono = "0.4.41"
+colored = "3.0.0"
