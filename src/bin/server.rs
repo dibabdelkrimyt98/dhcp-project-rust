@@ -1,159 +1,164 @@
 use std::collections::HashMap;
-use std::io::{self, Write};
-use std::net::UdpSocket;
+use std::net::{SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::io::{self, Write};
 
-use chrono::Local;
-use colored::*;
-use dhcp_demo::ip_pool::IpPool;
-
-#[derive(Debug, Clone)]
-struct ClientInfo {
-    ip: String,
-    historique: Vec<String>,
-    actif: bool,
+pub struct DHCPState {
+    pub leases: HashMap<SocketAddr, String>,
+    pub history: Vec<(SocketAddr, String)>,
+    pub available_ips: Vec<String>,
+    pub clients_status: HashMap<SocketAddr, bool>,
+    pub socket: UdpSocket,
 }
 
-fn afficher_clients(clients: &HashMap<String, ClientInfo>) {
-    println!("\n📋 Clients connectés :");
-    for (addr, client) in clients {
-        let status = if client.actif { "connecté".green() } else { "déconnecté".red() };
-        println!("🔹 {} => {} [{}]", addr, client.ip, status);
+impl DHCPState {
+    pub fn new(socket: UdpSocket, ip_pool: Vec<String>) -> Self {
+        DHCPState {
+            leases: HashMap::new(),
+            history: Vec::new(),
+            available_ips: ip_pool,
+            clients_status: HashMap::new(),
+            socket,
+        }
     }
-}
 
-fn afficher_historique(clients: &HashMap<String, ClientInfo>) {
-    println!("\n📜 Historique des clients :");
-    for (addr, client) in clients {
-        println!(
-            "🧾 {} → {} [{}]",
-            addr,
-            client.ip,
-            if client.actif { "connecté".green() } else { "déconnecté".red() }
-        );
-        for event in &client.historique {
-            println!("   ➜ {}", event);
+    pub fn handle_message(&mut self, msg: &str, src: SocketAddr) {
+        if msg.starts_with("DISCOVER") {
+            print!("\n\n ******** DORA ******** ");
+            println!("\n\n⬅️ DISCOVER reçu de {}", src);
+            if let Some(ip) = self.available_ips.pop() {
+                println!("➡️ Envoi OFFER {} à {}", ip, src);
+                self.leases.insert(src, ip.clone());
+                self.clients_status.insert(src, true);
+                self.history.push((src, ip.clone()));
+                let offer = format!("OFFER:{}", ip);
+                let _ = self.socket.send_to(offer.as_bytes(), src);
+            } else {
+                println!("⚠️ Pas d'IP disponible pour {}", src);
+                let _ = self.socket.send_to(b"NO_AVAILABLE_IP", src);
+            }
+        } else if msg.starts_with("REQUEST:") {
+            let requested_ip = msg.trim_start_matches("REQUEST:");
+            println!("⬅️ REQUEST {} reçu de {}", requested_ip, src);
+    
+            if self.leases.values().any(|ip| ip == requested_ip) && self.leases.get(&src) != Some(&requested_ip.to_string()) {
+                println!("❌ IP {} déjà utilisée, envoi DECLINE à {}", requested_ip, src);
+                let _ = self.socket.send_to(b"DECLINE:IP_IN_USE", src);
+            } else {
+                println!("➡️ Envoi ACK {} à {}", requested_ip, src);
+                self.leases.insert(src, requested_ip.to_string());
+                self.clients_status.insert(src, true);
+                self.history.push((src, requested_ip.to_string()));
+                let ack = format!("ACK:{}", requested_ip);
+                let _ = self.socket.send_to(ack.as_bytes(), src);
+            }
+        } else if msg.starts_with("RELEASE") {
+            println!("\n\n⬅️ RELEASE reçu de {}", src);
+            if let Some(ip) = self.leases.remove(&src) {
+                self.available_ips.push(ip.clone());
+                self.clients_status.remove(&src);
+                println!("🔁 IP {} libérée par {}", ip, src);
+            } else {
+                println!("⚠️ Aucune IP à libérer pour {}", src);
+            }
+        }
+    }
+
+    pub fn afficher_clients(&self) {
+        println!("📋 Clients connectés :");
+        for (addr, ip) in &self.leases {
+            let statut = if self.clients_status.get(addr).copied().unwrap_or(false) {
+                "[connecté]"
+            } else {
+                "[déconnecté]"
+            };
+            println!("🔹 {} => {} {}", addr, ip, statut);
+        }
+    }
+
+    pub fn afficher_historique(&self) {
+        println!("📜 Historique des baux :");
+        for (addr, ip) in &self.history {
+            println!("📍 {} => {}", addr, ip);
+        }
+    }
+
+    pub fn supprimer_client(&mut self, client_input: &str) {
+        let maybe_addr: Option<SocketAddr> = client_input.parse().ok();
+
+        match maybe_addr {
+            Some(addr) => {
+                if let Some(ip) = self.leases.remove(&addr) {
+                    self.available_ips.push(ip.clone());
+                    self.clients_status.remove(&addr);
+
+                    // Historique
+                    self.history.push((addr, ip.clone()));
+
+                    // Notifier le client
+                    let msg = format!("RELEASED_BY_ADMIN:{}", ip);
+                    let _ = self.socket.send_to(msg.as_bytes(), addr);
+
+                    println!("✅ Client {} supprimé. IP {} libérée.", addr, ip);
+                } else {
+                    println!("⚠️ Aucun client trouvé à cette adresse.");
+                }
+            }
+            None => println!("❌ Format d’adresse invalide."),
         }
     }
 }
 
-fn main() -> io::Result<()> {
-    let socket = UdpSocket::bind("127.0.0.1:6767")?;
-    println!("🚀 Serveur DHCP démarré sur {}", socket.local_addr()?);
+fn main() {
+    let socket = UdpSocket::bind("0.0.0.0:8080").expect("Erreur de liaison du socket");
+    socket.set_nonblocking(true).unwrap();
 
-    let clients: Arc<Mutex<HashMap<String, ClientInfo>>> = Arc::new(Mutex::new(HashMap::new()));
-    let clients_clone = Arc::clone(&clients);
-    let pool = Arc::new(Mutex::new(IpPool::new(100, 200))); // 192.168.1.100 à 192.168.1.200
-    let pool_clone = Arc::clone(&pool);
+    let ip_pool = (100..200)
+        .map(|i| format!("192.168.1.{}", i))
+        .collect::<Vec<_>>();
 
-    thread::spawn(move || loop {
-        let mut buf = [0; 512];
-        if let Ok((amt, src)) = socket.recv_from(&mut buf) {
-            let msg = String::from_utf8_lossy(&buf[..amt]);
-            let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-            println!("📩 [{}] Reçu de {} : {}", now, src, msg);
+    let state = Arc::new(Mutex::new(DHCPState::new(socket.try_clone().unwrap(), ip_pool)));
 
-            let mut clients = clients_clone.lock().unwrap();
-            let mut pool = pool_clone.lock().unwrap();
-
-            let entry = clients.entry(src.to_string()).or_insert(ClientInfo {
-                ip: "0.0.0.0".into(),
-                historique: Vec::new(),
-                actif: false,
-            });
-
-            let event = format!("{} ➜ {}", msg, now);
-            entry.historique.push(event.clone());
-
-            if msg.starts_with("DISCOVER") {
-                if let Some(ip) = pool.lease_ip() {
-                    entry.ip = ip.to_string();
-                    entry.actif = true;
-                    let offer = format!("OFFER:{}", ip);
-                    let _ = socket.send_to(offer.as_bytes(), src);
-                } else {
-                    let _ = socket.send_to(b"OFFER:0.0.0.0", src);
-                }
-            } else if msg.starts_with("REQUEST:") {
-                let ip_requested = msg.trim_start_matches("REQUEST:").trim();
-                if ip_requested == entry.ip {
-                    entry.actif = true;
-                    let ack = format!("ACK:{}", ip_requested);
-                    let _ = socket.send_to(ack.as_bytes(), src);
-                } else {
-                    let _ = socket.send_to(b"NAK", src);
-                }
-            } else if msg.starts_with("RELEASE:") {
-                let ip_to_release = msg.trim_start_matches("RELEASE:").trim();
-                if ip_to_release == entry.ip {
-                    pool.release_ip(&entry.ip.parse().unwrap());
-                    entry.actif = false;
-                    let _ = socket.send_to(b"RELEASED", src);
-                }
-            } else {
-                println!("⚠️ Message inconnu reçu : {}", msg);
+    let thread_state = Arc::clone(&state);
+    thread::spawn(move || {
+        let mut buf = [0; 1024];
+        loop {
+            if let Ok((len, src)) = socket.recv_from(&mut buf) {
+                let msg = String::from_utf8_lossy(&buf[..len]);
+                let mut st = thread_state.lock().unwrap();
+                st.handle_message(&msg, src);
             }
         }
     });
 
-    // Interface Console
     loop {
-        println!(
-            "\n===== MENU DHCP =====\n\
-            1️⃣  Afficher les clients connectés\n\
-            2️⃣  Supprimer un client (libérer une IP)\n\
-            3️⃣  Historique des clients\n\
-            4️⃣  Éteindre le serveur\n\
-            👉 Choix : "
-        );
-        io::stdout().flush()?;
+        println!("\n===== MENU DHCP =====");
+        println!("1️⃣  Afficher les clients connectés");
+        println!("2️⃣  Supprimer un client (libérer une IP)");
+        println!("3️⃣  Historique des clients");
+        println!("4️⃣  Éteindre le serveur");
+        print!("👉 Choix : ");
+        io::stdout().flush().unwrap();
+
         let mut choix = String::new();
-        io::stdin().read_line(&mut choix)?;
+        io::stdin().read_line(&mut choix).unwrap();
 
         match choix.trim() {
-            "1" => {
-                let clients = clients.lock().unwrap();
-                afficher_clients(&clients);
-            }
+            "1" => state.lock().unwrap().afficher_clients(),
             "2" => {
-                print!("🔧 Entrez l'adresse du client à supprimer : ");
-                io::stdout().flush()?;
+                print!("🔧 Entrez l'adresse du client à supprimer (IP:PORT) : ");
+                io::stdout().flush().unwrap();
                 let mut addr = String::new();
-                io::stdin().read_line(&mut addr)?;
-                let addr = addr.trim();
-                
-                let mut clients = clients.lock().unwrap();
-                let mut pool = pool.lock().unwrap();
-                
-                if let Some((key, client)) = clients.iter_mut().find(|(_, c)| c.ip == addr) {
-                    if client.actif {
-                        pool.release_ip(&client.ip.parse().unwrap());
-                    }
-                    client.actif = false;
-                    println!("✅ Client avec l'IP {} libéré.", addr);
-                } else if let Some(client) = clients.get_mut(addr) {
-                    // Ancienne logique si c’est une IP:PORT
-                    if client.actif {
-                        pool.release_ip(&client.ip.parse().unwrap());
-                    }
-                    client.actif = false;
-                    println!("✅ Client {} libéré.", addr);
-                } else {
-                    println!("❌ Client introuvable.");
-                }
+                io::stdin().read_line(&mut addr).unwrap();
+                state.lock().unwrap().supprimer_client(addr.trim());
             }
-            "3" => {
-                let clients = clients.lock().unwrap();
-                afficher_historique(&clients);
-            }
+            "3" => state.lock().unwrap().afficher_historique(),
             "4" => {
-                println!("🛑 Arrêt du serveur...");
+                println!("👋 Arrêt du serveur...");
                 break;
             }
-            _ => println!("❌ Choix invalide"),
+            _ => println!("❌ Choix invalide."),
         }
     }
-
-    Ok(())
 }
