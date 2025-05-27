@@ -54,7 +54,7 @@ impl DHCPState {
                 let _ = self.socket.send_to(ack.as_bytes(), src);
             }
         } else if msg.starts_with("RELEASE") {
-            println!("⬅️ RELEASE reçu de {}", src);
+            println!("\n\n⬅️ RELEASE reçu de {}", src);
             if let Some(ip) = self.leases.remove(&src) {
                 self.available_ips.push(ip.clone());
                 self.clients_status.remove(&src);
