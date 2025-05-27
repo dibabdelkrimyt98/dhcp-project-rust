@@ -4,9 +4,36 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::io::{self, Write};
 
+// Table OUI simplifiée : OUI (uppercase, sans séparateurs) -> marque
+fn lookup_oui(mac: &str) -> &'static str {
+    let oui_map = [
+        ("3C5A37", "Apple"),
+        ("FCFBFB", "Samsung"),
+        ("A4C138", "Dell"),
+        ("00163E", "Cisco"),
+        ("001A2B", "Hewlett-Packard"),
+        ("F4F5E8", "Sony"),
+        ("F0DE61", "Microsoft"),
+        ("3C5AB4", "Apple"),
+        ("B827EB", "Raspberry Pi Foundation"),
+    ];
+
+    let mac = mac.to_uppercase().replace(":", "").replace("-", "");
+    if mac.len() < 6 {
+        return "Unknown";
+    }
+    let prefix = &mac[0..6];
+    for (oui, vendor) in oui_map.iter() {
+        if *oui == prefix {
+            return vendor;
+        }
+    }
+    "Unknown"
+}
+
 pub struct DHCPState {
-    pub leases: HashMap<SocketAddr, String>,
-    pub history: Vec<(SocketAddr, String)>,
+    pub leases: HashMap<SocketAddr, (String, String)>, // IP + MAC
+    pub history: Vec<(SocketAddr, String, String)>,    // addr, IP, MAC
     pub available_ips: Vec<String>,
     pub clients_status: HashMap<SocketAddr, bool>,
     pub socket: UdpSocket,
@@ -24,41 +51,54 @@ impl DHCPState {
     }
 
     pub fn handle_message(&mut self, msg: &str, src: SocketAddr) {
-        if msg.starts_with("DISCOVER") {
-            print!("\n\n ******** DORA ******** ");
-            println!("\n\n⬅️ DISCOVER reçu de {}", src);
+        if msg.starts_with("DISCOVER:") {
+            let mac = msg.trim_start_matches("DISCOVER:").trim();
+            println!("\n\n ******** DORA ******** ");
+            println!("⬅️ DISCOVER reçu de {} avec MAC {}", src, mac);
             if let Some(ip) = self.available_ips.pop() {
-                println!("➡️ Envoi OFFER {} à {}", ip, src);
-                self.leases.insert(src, ip.clone());
+                let vendor = lookup_oui(mac);
+                println!("➡️ Envoi OFFER {} à {} (Marque: {})", ip, src, vendor);
+                self.leases.insert(src, (ip.clone(), mac.to_string()));
                 self.clients_status.insert(src, true);
-                self.history.push((src, ip.clone()));
-                let offer = format!("OFFER:{}", ip);
+                self.history.push((src, ip.clone(), mac.to_string()));
+                let offer = format!("OFFER:{}:{}", ip, mac);
                 let _ = self.socket.send_to(offer.as_bytes(), src);
             } else {
                 println!("⚠️ Pas d'IP disponible pour {}", src);
                 let _ = self.socket.send_to(b"NO_AVAILABLE_IP", src);
             }
         } else if msg.starts_with("REQUEST:") {
-            let requested_ip = msg.trim_start_matches("REQUEST:");
-            println!("⬅️ REQUEST {} reçu de {}", requested_ip, src);
-    
-            if self.leases.values().any(|ip| ip == requested_ip) && self.leases.get(&src) != Some(&requested_ip.to_string()) {
+            // Format attendu: REQUEST:<ip>:<mac>
+            let rest = msg.trim_start_matches("REQUEST:").trim();
+            let parts: Vec<&str> = rest.split(':').collect();
+            if parts.len() < 2 {
+                println!("❌ Format REQUEST invalide de {}", src);
+                return;
+            }
+            let requested_ip = parts[0];
+            let mac = parts[1];
+            println!("⬅️ REQUEST {} reçu de {} avec MAC {}", requested_ip, src, mac);
+
+            if self.leases.values().any(|(ip, _)| ip == requested_ip)
+                && self.leases.get(&src) != Some(&(requested_ip.to_string(), mac.to_string()))
+            {
                 println!("❌ IP {} déjà utilisée, envoi DECLINE à {}", requested_ip, src);
                 let _ = self.socket.send_to(b"DECLINE:IP_IN_USE", src);
             } else {
-                println!("➡️ Envoi ACK {} à {}", requested_ip, src);
-                self.leases.insert(src, requested_ip.to_string());
+                let vendor = lookup_oui(mac);
+                println!("➡️ Envoi ACK {} à {} (Marque: {})", requested_ip, src, vendor);
+                self.leases.insert(src, (requested_ip.to_string(), mac.to_string()));
                 self.clients_status.insert(src, true);
-                self.history.push((src, requested_ip.to_string()));
-                let ack = format!("ACK:{}", requested_ip);
+                self.history.push((src, requested_ip.to_string(), mac.to_string()));
+                let ack = format!("ACK:{}:{}", requested_ip, mac);
                 let _ = self.socket.send_to(ack.as_bytes(), src);
             }
         } else if msg.starts_with("RELEASE") {
             println!("\n\n⬅️ RELEASE reçu de {}", src);
-            if let Some(ip) = self.leases.remove(&src) {
+            if let Some((ip, mac)) = self.leases.remove(&src) {
                 self.available_ips.push(ip.clone());
                 self.clients_status.remove(&src);
-                println!("🔁 IP {} libérée par {}", ip, src);
+                println!("🔁 IP {} libérée par {} (MAC {})", ip, src, mac);
             } else {
                 println!("⚠️ Aucune IP à libérer pour {}", src);
             }
@@ -67,20 +107,22 @@ impl DHCPState {
 
     pub fn afficher_clients(&self) {
         println!("📋 Clients connectés :");
-        for (addr, ip) in &self.leases {
+        for (addr, (ip, mac)) in &self.leases {
             let statut = if self.clients_status.get(addr).copied().unwrap_or(false) {
                 "[connecté]"
             } else {
                 "[déconnecté]"
             };
-            println!("🔹 {} => {} {}", addr, ip, statut);
+            let vendor = lookup_oui(mac);
+            println!("🔹 {} => {} {} (MAC: {}, Marque: {})", addr, ip, statut, mac, vendor);
         }
     }
 
     pub fn afficher_historique(&self) {
         println!("📜 Historique des baux :");
-        for (addr, ip) in &self.history {
-            println!("📍 {} => {}", addr, ip);
+        for (addr, ip, mac) in &self.history {
+            let vendor = lookup_oui(mac);
+            println!("📍 {} => {} (MAC: {}, Marque: {})", addr, ip, mac, vendor);
         }
     }
 
@@ -89,12 +131,12 @@ impl DHCPState {
 
         match maybe_addr {
             Some(addr) => {
-                if let Some(ip) = self.leases.remove(&addr) {
+                if let Some((ip, mac)) = self.leases.remove(&addr) {
                     self.available_ips.push(ip.clone());
                     self.clients_status.remove(&addr);
 
                     // Historique
-                    self.history.push((addr, ip.clone()));
+                    self.history.push((addr, ip.clone(), mac.clone()));
 
                     // Notifier le client
                     let msg = format!("RELEASED_BY_ADMIN:{}", ip);
