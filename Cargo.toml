@@ -5,8 +5,8 @@ edition = "2021"
 
 [[bin]]
 name = "client"
-path = "src/client.rs"
+path = "src/bin/client.rs"
 
 [[bin]]
 name = "server"
-path = "src/server.rs"
+path = "src/bin/server.rs"
