@@ -5,10 +5,11 @@ use std::str;
 use std::time::Duration;
 use dhcp_demo::ip_pool::IpPool;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ClientInfo {
     ip: Ipv4Addr,
     active: bool,
+    events: Vec<String>,
 }
 
 fn main() -> std::io::Result<()> {
@@ -19,6 +20,7 @@ fn main() -> std::io::Result<()> {
     let mut pool = IpPool::new(100, 110);
     let mut buf = [0u8; 1024];
     let mut clients: HashMap<SocketAddr, ClientInfo> = HashMap::new();
+    let mut history: HashMap<SocketAddr, ClientInfo> = HashMap::new();
     let mut running = true;
 
     while running {
@@ -31,7 +33,13 @@ fn main() -> std::io::Result<()> {
                     if let Some(ip) = pool.lease_ip() {
                         let offer = format!("OFFER:{}", ip);
                         socket.send_to(offer.as_bytes(), src)?;
-                        clients.insert(src, ClientInfo { ip, active: true });
+                        let info = ClientInfo {
+                            ip,
+                            active: true,
+                            events: vec!["DISCOVER → OFFER".to_string()],
+                        };
+                        clients.insert(src, info.clone());
+                        history.insert(src, info);
                         println!("📤 OFFER envoyé à {} : {}\n", src, ip);
                     } else {
                         println!("❌ Plus d'IP disponibles à offrir !");
@@ -42,12 +50,16 @@ fn main() -> std::io::Result<()> {
                         if pool.confirm_lease(ip) {
                             let ack = format!("ACK:{}", ip);
                             socket.send_to(ack.as_bytes(), src)?;
-                            if let Some(client) = clients.get_mut(&src) {
-                                client.active = true;
-                                client.ip = ip;
-                            } else {
-                                clients.insert(src, ClientInfo { ip, active: true });
-                            }
+                            clients.entry(src).and_modify(|c| {
+                                c.active = true;
+                                c.ip = ip;
+                                c.events.push("REQUEST → ACK".to_string());
+                            }).or_insert(ClientInfo {
+                                ip,
+                                active: true,
+                                events: vec!["REQUEST → ACK".to_string()],
+                            });
+                            history.entry(src).or_insert_with(|| clients[&src].clone());
                             println!("✅ IP {} attribuée à {}\n", ip, src);
                         } else {
                             println!("⚠️ IP {} déjà louée ou invalide !", ip);
@@ -62,7 +74,7 @@ fn main() -> std::io::Result<()> {
 
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(200));
-                show_menu(&mut clients, &mut pool, &mut running);
+                show_menu(&mut clients, &mut history, &mut pool, &mut running);
             }
 
             Err(e) => {
@@ -77,13 +89,15 @@ fn main() -> std::io::Result<()> {
 
 fn show_menu(
     clients: &mut HashMap<SocketAddr, ClientInfo>,
+    history: &mut HashMap<SocketAddr, ClientInfo>,
     pool: &mut IpPool,
     running: &mut bool,
 ) {
     println!("\n===== MENU DHCP =====");
     println!("1️⃣  Afficher les clients connectés");
     println!("2️⃣  Supprimer un client (libérer une IP)");
-    println!("3️⃣  Éteindre le serveur");
+    println!("3️⃣  Historique des clients");
+    println!("4️⃣  Éteindre le serveur");
     print!("👉 Choix : ");
     io::stdout().flush().unwrap();
 
@@ -92,35 +106,53 @@ fn show_menu(
         match choice.trim() {
             "1" => {
                 if clients.is_empty() {
-                    println!("📭 Aucun client connecté.");
+                    println!("📭 Aucun client actif.");
                 } else {
-                    println!("📋 Liste des clients :");
+                    println!("📋 Clients connectés :");
                     for (addr, info) in clients.iter() {
-                        println!(
-                            "🔹 {} => {} [{}]",
-                            addr,
-                            info.ip,
-                            if info.active { "actif" } else { "inactif" }
-                        );
+                        println!("🔹 {} => {} [{}]", addr, info.ip, "actif");
                     }
                 }
             }
             "2" => {
-                println!("🔧 IP à libérer (ex: 192.168.1.105) :");
+                if clients.is_empty() {
+                    println!("📭 Aucun client actif.");
+                    return;
+                }
+
+                println!("📋 Liste des clients :");
+                for (addr, info) in clients.iter() {
+                    println!("🔸 {} => {}", addr, info.ip);
+                }
+
+                println!("✏️ Entrez l'IP à supprimer (ex: 192.168.1.105) :");
                 let mut ip_input = String::new();
                 if io::stdin().read_line(&mut ip_input).is_ok() {
                     let ip_str = ip_input.trim();
                     if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
-                        let target = clients.iter()
+                        let maybe_addr = clients.iter()
                             .find(|(_, c)| c.ip == ip)
                             .map(|(addr, _)| *addr);
 
-                        if let Some(addr) = target {
-                            clients.remove(&addr);
-                            pool.release_ip(&ip);
-                            println!("✅ IP {} libérée (client supprimé).", ip);
+                        if let Some(addr) = maybe_addr {
+                            print!("❓ Voulez-vous vraiment supprimer ce client ? (O/N): ");
+                            io::stdout().flush().unwrap();
+                            let mut confirm = String::new();
+                            if io::stdin().read_line(&mut confirm).is_ok() {
+                                if confirm.trim().eq_ignore_ascii_case("O") {
+                                    if let Some(mut client) = clients.remove(&addr) {
+                                        client.active = false;
+                                        client.events.push("🔴 IP libérée manuellement".to_string());
+                                        pool.release_ip(&client.ip);
+                                        history.insert(addr, client);
+                                        println!("✅ Client supprimé et IP {} libérée.", ip);
+                                    }
+                                } else {
+                                    println!("❌ Suppression annulée.");
+                                }
+                            }
                         } else {
-                            println!("❌ Aucun client avec cette IP.");
+                            println!("❌ Aucun client actif avec cette IP.");
                         }
                     } else {
                         println!("❌ IP invalide !");
@@ -128,6 +160,24 @@ fn show_menu(
                 }
             }
             "3" => {
+                if history.is_empty() {
+                    println!("📭 Aucun historique enregistré.");
+                } else {
+                    println!("📜 Historique des clients :");
+                    for (addr, info) in history.iter() {
+                        println!(
+                            "🧾 {} → {} [{}]",
+                            addr,
+                            info.ip,
+                            if info.active { "actif" } else { "supprimé" }
+                        );
+                        for ev in &info.events {
+                            println!("   ➜ {}", ev);
+                        }
+                    }
+                }
+            }
+            "4" => {
                 *running = false;
             }
             _ => println!("❌ Choix invalide."),

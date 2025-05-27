@@ -5,8 +5,8 @@ use std::thread;
 use dhcp_demo::ip_pool::IpPool;
 
 fn main() -> std::io::Result<()> {
-    let socket = UdpSocket::bind("127.0.0.1:0")?;
-    socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    socket.set_read_timeout(Some(Duration::from_secs(15)))?;
     let server_addr = "127.0.0.1:6767";
 
     println!("🔎 Envoi DISCOVER...");
