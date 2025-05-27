@@ -5,8 +5,8 @@ use std::thread;
 use dhcp_demo::ip_pool::IpPool;
 
 fn main() -> std::io::Result<()> {
-    let socket = UdpSocket::bind("127.0.0.1:0")?;
-    socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    socket.set_read_timeout(Some(Duration::from_secs(15)))?;
     let server_addr = "127.0.0.1:6767";
 
     println!("🔎 Envoi DISCOVER...");
@@ -45,7 +45,16 @@ fn main() -> std::io::Result<()> {
                         
                             let release = format!("RELEASE:{}", ip);
                             socket.send_to(release.as_bytes(), server_addr)?;
-                            println!("🔓 IP {} relâchée.", ip);
+                            println!("🔓 Demande de libération de l'IP envoyée...");
+                            
+                            // 🔁 Attente de la confirmation du serveur
+                            match socket.recv_from(&mut buf) {
+                                Ok((len, _)) => {
+                                    let confirmation = str::from_utf8(&buf[..len]).unwrap_or("");
+                                    println!("📩 Confirmation serveur : {}", confirmation);
+                                }
+                                Err(e) => println!("⚠️  Aucune confirmation reçue du serveur : {}", e),
+                            }
                         }
                     }
                     Err(e) => println!("❌ Timeout ou erreur lors du ACK: {}", e),
