@@ -1,6 +1,5 @@
-C:\Users\HP\Downloads\dhcp_demo\target\debug\deps\server.exe: src\server.rs src\ip_pool.rs
+C:\Users\HP\Downloads\dhcp_demo\target\debug\deps\server.exe: src\bin\server.rs
 
-C:\Users\HP\Downloads\dhcp_demo\target\debug\deps\server.d: src\server.rs src\ip_pool.rs
+C:\Users\HP\Downloads\dhcp_demo\target\debug\deps\server.d: src\bin\server.rs
 
-src\server.rs:
-src\ip_pool.rs:
+src\bin\server.rs:

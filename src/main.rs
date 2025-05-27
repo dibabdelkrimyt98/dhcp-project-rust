@@ -1,6 +1,6 @@
 mod ip_pool;
-
 use ip_pool::IpPool;
+use std::net::Ipv4Addr;
 
 fn main() {
     println!("🚀 Test du module IpPool...");
@@ -16,8 +16,8 @@ fn main() {
     }
 
     println!("🔁 Libération d'une IP et réattribution :");
-    let ip_to_release = "192.168.1.101".parse().unwrap();
-    pool.release_ip(&ip_to_release);
+    let ip_to_release: Ipv4Addr = "192.168.1.101".parse().unwrap();
+    pool.release_ip(&ip_to_release); // plus de & nécessaire
 
     match pool.lease_ip() {
         Some(ip) => println!("🔁 IP réattribuée : {}", ip),

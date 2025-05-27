@@ -28,11 +28,9 @@ impl IpPool {
     }
 
     pub fn confirm_lease(&mut self, ip: Ipv4Addr) -> bool {
-        // Si IP dispo dans leased_ips, c’est ok
         if self.leased_ips.contains(&ip) {
             true
         } else if self.available_ips.contains(&ip) {
-            // Si elle est dispo dans available, on la loue
             self.available_ips.retain(|&x| x != ip);
             self.leased_ips.push(ip);
             true
@@ -40,8 +38,8 @@ impl IpPool {
             false
         }
     }
+
     pub fn release_ip(&mut self, ip: &Ipv4Addr) {
-        // Si l'IP est dans leased_ips, on la retire et on la remet dans available_ips
         if let Some(pos) = self.leased_ips.iter().position(|x| x == ip) {
             self.leased_ips.remove(pos);
             self.available_ips.push(*ip);

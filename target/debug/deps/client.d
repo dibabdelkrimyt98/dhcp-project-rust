@@ -1,5 +1,5 @@
-C:\Users\HP\Downloads\dhcp_demo\target\debug\deps\client.exe: src\client.rs
+C:\Users\HP\Downloads\dhcp_demo\target\debug\deps\client.exe: src\bin\client.rs
 
-C:\Users\HP\Downloads\dhcp_demo\target\debug\deps\client.d: src\client.rs
+C:\Users\HP\Downloads\dhcp_demo\target\debug\deps\client.d: src\bin\client.rs
 
-src\client.rs:
+src\bin\client.rs:
