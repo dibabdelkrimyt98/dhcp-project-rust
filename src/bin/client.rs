@@ -38,9 +38,11 @@ fn main() -> std::io::Result<()> {
 
                         if ack_msg.starts_with("ACK:") {
                             println!("🎉 IP {} assignée avec succès!", ip);
-
-                            // Simuler une utilisation puis RELEASE
-                            thread::sleep(Duration::from_secs(5));
+                            
+                            println!("⏳ Appuyez sur Entrée pour relâcher l'IP et quitter...");
+                            let mut input = String::new();
+                            let _ = std::io::stdin().read_line(&mut input); // attend l'utilisateur
+                        
                             let release = format!("RELEASE:{}", ip);
                             socket.send_to(release.as_bytes(), server_addr)?;
                             println!("🔓 IP {} relâchée.", ip);
