@@ -1,67 +1,47 @@
 use std::net::UdpSocket;
-use std::str;
 use std::time::Duration;
-use std::thread;
-use dhcp_demo::ip_pool::IpPool;
+use std::io;
 
-fn main() -> std::io::Result<()> {
+fn main() -> io::Result<()> {
     let socket = UdpSocket::bind("0.0.0.0:0")?;
-    socket.set_read_timeout(Some(Duration::from_secs(15)))?;
-    let server_addr = "127.0.0.1:6767";
+    socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+    socket.connect("127.0.0.1:8080")?;
 
-    println!("🔎 Envoi DISCOVER...");
-    socket.send_to(b"DISCOVER", server_addr)?;
     let mut buf = [0u8; 1024];
 
-    match socket.recv_from(&mut buf) {
-        Ok((len, _)) => {
-            let msg = {
-                let temp = str::from_utf8(&buf[..len]).unwrap_or("");
-                println!("📨 Réponse serveur : {}", temp);
-                temp.to_string() // on le transforme en String pour éviter l'emprunt
-            };
+    println!("➡️  Envoi DISCOVER");
+    socket.send(b"DISCOVER")?;
 
-            if msg.starts_with("OFFER:") {
-                let ip = msg.trim_start_matches("OFFER:");
-                let request = format!("REQUEST:{}", ip);
-                println!("📥 Envoi de la requête de demande IP {}...", ip);
-                socket.send_to(request.as_bytes(), server_addr)?;
+    let len = socket.recv(&mut buf)?;
+    let response = String::from_utf8_lossy(&buf[..len]).to_string();
+    println!("⬅️  Réception OFFER : {}", response);
 
-                // Nouvelle réception -> nouvelle portée propre
-                match socket.recv_from(&mut buf) {
-                    Ok((len, _)) => {
-                        let ack_msg = {
-                            let temp = str::from_utf8(&buf[..len]).unwrap_or("");
-                            println!("✅ Réponse finale : {}", temp);
-                            temp.to_string()
-                        };
+    if response.starts_with("OFFER:") {
+        let offered_ip = response.trim_start_matches("OFFER:");
 
-                        if ack_msg.starts_with("ACK:") {
-                            println!("🎉 IP {} assignée avec succès!", ip);
-                            
-                            println!("⏳ Appuyez sur Entrée pour relâcher l'IP et quitter...");
-                            let mut input = String::new();
-                            let _ = std::io::stdin().read_line(&mut input); // attend l'utilisateur
-                        
-                            let release = format!("RELEASE:{}", ip);
-                            socket.send_to(release.as_bytes(), server_addr)?;
-                            println!("🔓 Demande de libération de l'IP envoyée...");
-                            
-                            // 🔁 Attente de la confirmation du serveur
-                            match socket.recv_from(&mut buf) {
-                                Ok((len, _)) => {
-                                    let confirmation = str::from_utf8(&buf[..len]).unwrap_or("");
-                                    println!("📩 Confirmation serveur : {}", confirmation);
-                                }
-                                Err(e) => println!("⚠️  Aucune confirmation reçue du serveur : {}", e),
-                            }
-                        }
-                    }
-                    Err(e) => println!("❌ Timeout ou erreur lors du ACK: {}", e),
-                }
-            }
+        println!("➡️  Envoi REQUEST pour l'IP {}", offered_ip);
+        let request_msg = format!("REQUEST:{}", offered_ip);
+        socket.send(request_msg.as_bytes())?;
+
+        let len = socket.recv(&mut buf)?;
+        let ack_response = String::from_utf8_lossy(&buf[..len]).to_string();
+        println!("⬅️  Réception ACK ou DECLINE : {}", ack_response);
+
+        if ack_response.starts_with("ACK:") {
+            println!("✅ Bail DHCP accepté pour l'IP {}", offered_ip);
+
+            println!("Appuyez sur Entrée pour libérer l'adresse IP...");
+            let mut input = String::new();
+            io::stdin().read_line(&mut input)?;
+
+            println!("➡️  Envoi RELEASE");
+            socket.send(b"RELEASE")?;
+            println!("🔁 Bail DHCP libéré.");
+        } else {
+            println!("❌ Demande rejetée par le serveur : {}", ack_response);
         }
-        Err(e) => println!("❌ Timeout ou erreur lors du OFFER: {}", e),
+    } else {
+        println!("❌ Aucune offre reçue, fin du processus.");
     }
 
     Ok(())
