@@ -1,8 +1,10 @@
+// server.rs
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::io::{self, Write};
+use rusqlite::{Connection, params, OptionalExtension};
 
 // Table OUI simplifiée : OUI (uppercase, sans séparateurs) -> marque
 fn lookup_oui(mac: &str) -> &'static str {
@@ -31,22 +33,59 @@ fn lookup_oui(mac: &str) -> &'static str {
     "Unknown"
 }
 
+// Initialise la base de données
+fn init_db() -> rusqlite::Result<Connection> {
+    let conn = Connection::open("dhcp.db")?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS leases (
+            id INTEGER PRIMARY KEY,
+            mac TEXT NOT NULL,
+            ip TEXT NOT NULL,
+            start_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+            end_time DATETIME,
+            vendor TEXT,
+            status TEXT
+        )",
+        [],
+    )?;
+    Ok(conn)
+}
+
+// Enregistre un nouveau bail dans la base de données
+fn log_lease(conn: &Connection, mac: &str, ip: &str, vendor: &str, status: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO leases (mac, ip, vendor, status) VALUES (?1, ?2, ?3, ?4)",
+        params![mac, ip, vendor, status],
+    )?;
+    Ok(())
+}
+
+// Met à jour le statut d'un bail
+fn update_lease_status(conn: &Connection, mac: &str, ip: &str, status: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE leases SET end_time = CURRENT_TIMESTAMP, status = ?1 
+         WHERE mac = ?2 AND ip = ?3 AND end_time IS NULL",
+        params![status, mac, ip],
+    )?;
+    Ok(())
+}
+
 pub struct DHCPState {
     pub leases: HashMap<SocketAddr, (String, String)>, // IP + MAC
-    pub history: Vec<(SocketAddr, String, String)>,    // addr, IP, MAC
     pub available_ips: Vec<String>,
     pub clients_status: HashMap<SocketAddr, bool>,
     pub socket: UdpSocket,
+    pub db_conn: Arc<Mutex<Connection>>, // Connexion à la base SQLite
 }
 
 impl DHCPState {
-    pub fn new(socket: UdpSocket, ip_pool: Vec<String>) -> Self {
+    pub fn new(socket: UdpSocket, ip_pool: Vec<String>, db_conn: Connection) -> Self {
         DHCPState {
             leases: HashMap::new(),
-            history: Vec::new(),
             available_ips: ip_pool,
             clients_status: HashMap::new(),
             socket,
+            db_conn: Arc::new(Mutex::new(db_conn)),
         }
     }
 
@@ -60,7 +99,18 @@ impl DHCPState {
                 println!("➡️ Envoi OFFER {} à {} (Marque: {})", ip, src, vendor);
                 self.leases.insert(src, (ip.clone(), mac.to_string()));
                 self.clients_status.insert(src, true);
-                self.history.push((src, ip.clone(), mac.to_string()));
+                
+                // Enregistrement dans la base de données
+                let db = self.db_conn.clone();
+                let mac_clone = mac.to_string();
+                let ip_clone = ip.clone();
+                let vendor_clone = vendor.to_string();
+                thread::spawn(move || {
+                    let conn = db.lock().unwrap();
+                    log_lease(&conn, &mac_clone, &ip_clone, &vendor_clone, "OFFERED")
+                        .unwrap_or_else(|e| eprintln!("Erreur DB: {}", e));
+                });
+                
                 let offer = format!("OFFER:{}:{}", ip, mac);
                 let _ = self.socket.send_to(offer.as_bytes(), src);
             } else {
@@ -89,7 +139,17 @@ impl DHCPState {
                 println!("➡️ Envoi ACK {} à {} (Marque: {})", requested_ip, src, vendor);
                 self.leases.insert(src, (requested_ip.to_string(), mac.to_string()));
                 self.clients_status.insert(src, true);
-                self.history.push((src, requested_ip.to_string(), mac.to_string()));
+                
+                // Mise à jour du bail dans la base de données
+                let db = self.db_conn.clone();
+                let mac_clone = mac.to_string();
+                let ip_clone = requested_ip.to_string();
+                thread::spawn(move || {
+                    let conn = db.lock().unwrap();
+                    update_lease_status(&conn, &mac_clone, &ip_clone, "ACKNOWLEDGED")
+                        .unwrap_or_else(|e| eprintln!("Erreur DB: {}", e));
+                });
+                
                 let ack = format!("ACK:{}:{}", requested_ip, mac);
                 let _ = self.socket.send_to(ack.as_bytes(), src);
             }
@@ -99,6 +159,14 @@ impl DHCPState {
                 self.available_ips.push(ip.clone());
                 self.clients_status.remove(&src);
                 println!("🔁 IP {} libérée par {} (MAC {})", ip, src, mac);
+                
+                // Mise à jour du bail dans la base de données
+                let db = self.db_conn.clone();
+                thread::spawn(move || {
+                    let conn = db.lock().unwrap();
+                    update_lease_status(&conn, &mac, &ip, "RELEASED")
+                        .unwrap_or_else(|e| eprintln!("Erreur DB: {}", e));
+                });
             } else {
                 println!("⚠️ Aucune IP à libérer pour {}", src);
             }
@@ -120,9 +188,31 @@ impl DHCPState {
 
     pub fn afficher_historique(&self) {
         println!("📜 Historique des baux :");
-        for (addr, ip, mac) in &self.history {
-            let vendor = lookup_oui(mac);
-            println!("📍 {} => {} (MAC: {}, Marque: {})", addr, ip, mac, vendor);
+        let conn = self.db_conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT mac, ip, vendor, start_time, end_time, status 
+             FROM leases ORDER BY start_time DESC"
+        ).unwrap();
+        
+        let lease_iter = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        }).unwrap();
+
+        for lease in lease_iter {
+            if let Ok((mac, ip, vendor, start, end, status)) = lease {
+                let end_time = end.unwrap_or_else(|| "En cours".to_string());
+                println!(
+                    "📍 {} - {} ({}) | Statut: {} | Début: {} | Fin: {}",
+                    mac, ip, vendor, status, start, end_time
+                );
+            }
         }
     }
 
@@ -135,8 +225,15 @@ impl DHCPState {
                     self.available_ips.push(ip.clone());
                     self.clients_status.remove(&addr);
 
-                    // Historique
-                    self.history.push((addr, ip.clone(), mac.clone()));
+                    // Mise à jour du bail dans la base de données
+                    let db = self.db_conn.clone();
+                    let mac_clone = mac.clone();
+                    let ip_clone = ip.clone();
+                    thread::spawn(move || {
+                        let conn = db.lock().unwrap();
+                        update_lease_status(&conn, &mac_clone, &ip_clone, "RELEASED_BY_ADMIN")
+                            .unwrap_or_else(|e| eprintln!("Erreur DB: {}", e));
+                    });
 
                     // Notifier le client
                     let msg = format!("RELEASED_BY_ADMIN:{}", ip);
@@ -153,14 +250,21 @@ impl DHCPState {
 }
 
 fn main() {
-    let socket = UdpSocket::bind("0.0.0.0:8080").expect("Erreur de liaison du socket");
+    // Initialisation de la base de données
+    let db_conn = init_db().expect("Erreur initialisation base de données");
+    
+    let socket = UdpSocket::bind("0.0.0.0:67").expect("Erreur de liaison du socket");
     socket.set_nonblocking(true).unwrap();
 
     let ip_pool = (100..200)
         .map(|i| format!("192.168.1.{}", i))
         .collect::<Vec<_>>();
 
-    let state = Arc::new(Mutex::new(DHCPState::new(socket.try_clone().unwrap(), ip_pool)));
+    let state = Arc::new(Mutex::new(DHCPState::new(
+        socket.try_clone().unwrap(), 
+        ip_pool,
+        db_conn
+    )));
 
     let thread_state = Arc::clone(&state);
     thread::spawn(move || {
