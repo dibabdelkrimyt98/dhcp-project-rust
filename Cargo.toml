@@ -16,6 +16,7 @@ path = "src/bin/server.rs"
 [dependencies]
 chrono = "0.4.41"
 colored = "3.0.0"
-rusqlite = { version = "0.29", features = ["bundled"] }
+rusqlite = { version = "0.36", features = ["bundled"] }
 get_if_addrs = "0.5"
-pnet = "0.30"
+pnet = "0.35"
+ctrlc = "3.4.7"
